@@ -448,7 +448,7 @@ def action_edit(action_id):
 @role_required('admin','gestor','consulta')
 def treatment():
     rows=[dict(x) for x in get_db().execute('''SELECT a.*,r.code risk_code,r.name risk_name,r.inherent_level,r.residual_level,asst.name asset_name FROM actions a JOIN risks r ON r.id=a.risk_id LEFT JOIN assets asst ON asst.id=r.asset_id ORDER BY CASE a.status WHEN 'Atrasada' THEN 1 WHEN 'En curso' THEN 2 WHEN 'Pendiente' THEN 3 ELSE 4 END,a.due_date''').fetchall()]
-    for a in rows: a['controls_list']=get_db().execute('SELECT c.code FROM action_controls ac JOIN controls c ON c.id=ac.control_id WHERE ac.action_id=? ORDER BY c.code',(a['id'],)).fetchall()
+    for a in rows: a['controls_list']=get_db().execute('SELECT c.code,c.implementation_status FROM action_controls ac JOIN controls c ON c.id=ac.control_id WHERE ac.action_id=? ORDER BY c.code',(a['id'],)).fetchall()
     return render_template('treatment.html', title='Plan de tratamiento', actions=rows, today=date.today().isoformat())
 
 @app.route('/reports/risks.csv')
