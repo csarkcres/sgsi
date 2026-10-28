@@ -461,8 +461,16 @@ def action_edit(action_id):
         if is_admin:
             action=request.form.get('action','').strip()
             if not action: flash('La acción es obligatoria.','error'); return redirect(url_for('action_edit',action_id=action_id))
-            db.execute('UPDATE actions SET control=?,action=?,responsible=?,start_date=?,due_date=?,product=?,evidence=?,status=?,progress=? WHERE id=?',
-              (request.form.get('control',''),action,request.form.get('responsible',''),request.form.get('start_date',''),request.form.get('due_date',''),request.form.get('product',''),request.form.get('evidence',''),request.form.get('status','Pendiente'),form_int('progress',0,0,100),action_id))
+            requested_status=request.form.get('status','Pendiente')
+            progress=form_int('progress',0,0,100)
+            if requested_status=='Completada':
+                requested_status='En curso'
+                closure_status='Pendiente de validación' if progress>=100 else 'No solicitada'
+                flash('El cierre no se aprueba desde la edición. Se requiere validación explícita del cierre.','warning')
+            else:
+                closure_status='No solicitada'
+            db.execute('UPDATE actions SET control=?,action=?,responsible=?,start_date=?,due_date=?,product=?,evidence=?,status=?,progress=?,closure_status=?,closure_validated_by=NULL,closure_validated_at=NULL WHERE id=?',
+              (request.form.get('control',''),action,request.form.get('responsible',''),request.form.get('start_date',''),request.form.get('due_date',''),request.form.get('product',''),request.form.get('evidence',''),requested_status,progress,closure_status,action_id))
             db.execute('DELETE FROM action_controls WHERE action_id=?',(action_id,))
             for cid in request.form.getlist('control_ids'):
                 if db.execute('SELECT 1 FROM controls WHERE id=? AND applicable=1',(cid,)).fetchone(): db.execute('INSERT OR IGNORE INTO action_controls(action_id,control_id) VALUES(?,?)',(action_id,cid))
