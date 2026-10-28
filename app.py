@@ -441,8 +441,15 @@ def action_new(risk_id):
     if request.method=='POST':
         action=request.form.get('action','').strip()
         if not action: flash('La acción es obligatoria.','error'); return redirect(url_for('action_new',risk_id=risk_id))
-        cur=db.execute('INSERT INTO actions(risk_id,control,action,responsible,start_date,due_date,product,evidence,status,progress,observations) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
-        (risk_id,request.form.get('control',''),action,request.form.get('responsible',''),request.form.get('start_date',''),request.form.get('due_date',''),request.form.get('product',''),request.form.get('evidence',''),request.form.get('status','Pendiente'),form_int('progress',0,0,100),request.form.get('observations','')))
+        requested_status=request.form.get('status','Pendiente')
+        progress=form_int('progress',0,0,100)
+        closure_status='No solicitada'
+        if requested_status=='Completada':
+            requested_status='En curso'
+            closure_status='Pendiente de validación' if progress>=100 else 'No solicitada'
+            flash('El cierre requiere validación explícita después de registrar la acción.','warning')
+        cur=db.execute('INSERT INTO actions(risk_id,control,action,responsible,start_date,due_date,product,evidence,status,progress,observations,closure_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+        (risk_id,request.form.get('control',''),action,request.form.get('responsible',''),request.form.get('start_date',''),request.form.get('due_date',''),request.form.get('product',''),request.form.get('evidence',''),requested_status,progress,request.form.get('observations',''),closure_status))
         audit('action',cur.lastrowid,'create',action)
         for cid in request.form.getlist('control_ids'):
             if db.execute('SELECT 1 FROM controls WHERE id=? AND applicable=1',(cid,)).fetchone(): db.execute('INSERT OR IGNORE INTO action_controls(action_id,control_id) VALUES(?,?)',(cur.lastrowid,cid))
