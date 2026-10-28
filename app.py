@@ -148,6 +148,35 @@ def init_db():
       FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
     );
     ''')
+    # Migraciones incrementales: conservan los registros existentes.
+    def ensure_column(table, column, definition):
+        columns = {row['name'] for row in db.execute(f'PRAGMA table_info({table})').fetchall()}
+        if column not in columns:
+            db.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+    ensure_column('actions', 'closure_status', "TEXT NOT NULL DEFAULT 'No solicitada'")
+    ensure_column('actions', 'closure_validated_by', 'INTEGER')
+    ensure_column('actions', 'closure_validated_at', 'TEXT')
+    ensure_column('audit_log', 'user_id', 'INTEGER')
+    db.executescript('''
+    CREATE TABLE IF NOT EXISTS action_evidence (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, action_id INTEGER NOT NULL,
+      description TEXT NOT NULL, reference TEXT DEFAULT '', submitted_by INTEGER,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(action_id) REFERENCES actions(id) ON DELETE CASCADE,
+      FOREIGN KEY(submitted_by) REFERENCES users(id) ON DELETE SET NULL
+    );
+    CREATE TABLE IF NOT EXISTS risk_reevaluations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, risk_id INTEGER NOT NULL,
+      previous_probability INTEGER NOT NULL, previous_impact INTEGER NOT NULL,
+      previous_score INTEGER NOT NULL, previous_level TEXT NOT NULL,
+      new_probability INTEGER NOT NULL, new_impact INTEGER NOT NULL,
+      new_score INTEGER NOT NULL, new_level TEXT NOT NULL,
+      justification TEXT NOT NULL, responsible_id INTEGER,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(risk_id) REFERENCES risks(id) ON DELETE CASCADE,
+      FOREIGN KEY(responsible_id) REFERENCES users(id) ON DELETE SET NULL
+    );
+    ''')
     for code, title in ANNEX_A_CONTROLS:
         category = {'A.5':'Organizacionales','A.6':'Personas','A.7':'Físicos','A.8':'Tecnológicos'}[code[:3]]
         db.execute('INSERT OR IGNORE INTO controls(code,category,title) VALUES(?,?,?)',(code,category,title))
@@ -261,7 +290,9 @@ def user_toggle(user_id):
     return redirect(url_for('users'))
 
 def audit(entity, entity_id, operation, detail=''):
-    get_db().execute('INSERT INTO audit_log(entity,entity_id,operation,detail) VALUES(?,?,?,?)', (entity,entity_id,operation,detail))
+    user = current_user()
+    get_db().execute('INSERT INTO audit_log(entity,entity_id,operation,detail,user_id) VALUES(?,?,?,?,?)',
+                     (entity, entity_id, operation, detail, user['id'] if user else None))
     get_db().commit()
 
 def calculate_risk(probability, impact):
@@ -374,7 +405,12 @@ def risk_detail(risk_id):
         a['history']=db.execute('SELECT ao.*,u.display_name FROM action_observations ao LEFT JOIN users u ON u.id=ao.user_id WHERE ao.action_id=? ORDER BY ao.created_at,ao.id',(a['id'],)).fetchall()
         a['controls_list']=db.execute('SELECT c.code,c.title FROM action_controls ac JOIN controls c ON c.id=ac.control_id WHERE ac.action_id=? ORDER BY c.code',(a['id'],)).fetchall()
     risk_controls=db.execute('SELECT c.code,c.title FROM risk_controls rc JOIN controls c ON c.id=rc.control_id WHERE rc.risk_id=? ORDER BY c.code',(risk_id,)).fetchall()
-    return render_template('risk_detail.html', title=r['code'] or r['name'], risk=r, actions=actions, risk_controls=risk_controls, today=date.today().isoformat())
+    progress_row = db.execute("SELECT COUNT(*) total, COALESCE(AVG(progress),0) avg_progress, SUM(CASE WHEN status='Completada' THEN 1 ELSE 0 END) completed FROM actions WHERE risk_id=? AND status<>'Cancelada'",(risk_id,)).fetchone()
+    reevaluations = db.execute('SELECT rr.*,u.display_name FROM risk_reevaluations rr LEFT JOIN users u ON u.id=rr.responsible_id WHERE rr.risk_id=? ORDER BY rr.created_at DESC,rr.id DESC',(risk_id,)).fetchall()
+    evidence_by_action = {}
+    for action_row in actions:
+        evidence_by_action[action_row['id']] = db.execute('SELECT ae.*,u.display_name FROM action_evidence ae LEFT JOIN users u ON u.id=ae.submitted_by WHERE ae.action_id=? ORDER BY ae.created_at DESC,ae.id DESC',(action_row['id'],)).fetchall()
+    return render_template('risk_detail.html', title=r['code'] or r['name'], risk=r, actions=actions, risk_controls=risk_controls, today=date.today().isoformat(), treatment_progress=round(progress_row['avg_progress'] or 0), treatment_total=progress_row['total'] or 0, treatment_completed=progress_row['completed'] or 0, reevaluations=reevaluations, evidence_by_action=evidence_by_action)
 
 @app.route('/risks/<int:risk_id>/edit', methods=['GET','POST'])
 @role_required('admin')
@@ -433,7 +469,7 @@ def action_edit(action_id):
             audit('action',action_id,'update',action)
         elif is_manager:
             progress=form_int('progress',0,0,100)
-            db.execute("UPDATE actions SET progress=?, status=CASE WHEN ?=100 THEN 'Completada' WHEN ?>0 THEN 'En curso' WHEN status='Completada' THEN 'En curso' ELSE status END WHERE id=?",(progress,progress,progress,action_id))
+            db.execute("UPDATE actions SET progress=?, status=CASE WHEN ?>0 THEN 'En curso' WHEN status IN ('Completada','Pendiente validación') THEN 'En curso' ELSE status END, closure_status=CASE WHEN ?>=100 THEN 'Pendiente de validación' ELSE 'No solicitada' END, closure_validated_by=NULL, closure_validated_at=NULL WHERE id=?",(progress,progress,progress,action_id))
             observation=request.form.get('new_observation','').strip()
             if observation: db.execute('INSERT INTO action_observations(action_id,user_id,observation) VALUES(?,?,?)',(action_id,user['id'],observation))
             audit('action',action_id,'progress_update',f'avance={progress}; observación agregada={bool(observation)}')
@@ -449,7 +485,69 @@ def action_edit(action_id):
 def treatment():
     rows=[dict(x) for x in get_db().execute('''SELECT a.*,r.code risk_code,r.name risk_name,r.inherent_level,r.residual_level,asst.name asset_name FROM actions a JOIN risks r ON r.id=a.risk_id LEFT JOIN assets asst ON asst.id=r.asset_id ORDER BY CASE a.status WHEN 'Atrasada' THEN 1 WHEN 'En curso' THEN 2 WHEN 'Pendiente' THEN 3 ELSE 4 END,a.due_date''').fetchall()]
     for a in rows: a['controls_list']=get_db().execute('SELECT c.code FROM action_controls ac JOIN controls c ON c.id=ac.control_id WHERE ac.action_id=? ORDER BY c.code',(a['id'],)).fetchall()
-    return render_template('treatment.html', title='Plan de tratamiento', actions=rows, today=date.today().isoformat())
+    status_filter=request.args.get('status','').strip()
+    overdue_filter=request.args.get('overdue','') == '1'
+    if status_filter:
+        rows=[a for a in rows if a['status']==status_filter]
+    if overdue_filter:
+        rows=[a for a in rows if a['due_date'] and a['due_date'] < date.today().isoformat() and a['status'] not in ('Completada','Cancelada')]
+    return render_template('treatment.html', title='Plan de tratamiento', actions=rows, today=date.today().isoformat(), status_filter=status_filter, overdue_filter=overdue_filter)
+
+
+@app.route('/actions/<int:action_id>/evidence', methods=['POST'])
+@role_required('admin','gestor')
+def action_add_evidence(action_id):
+    db=get_db(); action=db.execute('SELECT * FROM actions WHERE id=?',(action_id,)).fetchone()
+    if not action: abort(404)
+    description=request.form.get('description','').strip(); reference=request.form.get('reference','').strip()
+    if not description:
+        flash('Describe la evidencia antes de guardarla.','error')
+        return redirect(url_for('action_edit',action_id=action_id))
+    user=current_user()
+    db.execute('INSERT INTO action_evidence(action_id,description,reference,submitted_by) VALUES(?,?,?,?)',(action_id,description,reference,user['id']))
+    audit('action',action_id,'evidence_added',description[:240]); db.commit()
+    flash('Evidencia registrada con responsable y fecha.','success')
+    return redirect(url_for('risk_detail',risk_id=action['risk_id']))
+
+@app.route('/actions/<int:action_id>/validate-closure', methods=['POST'])
+@role_required('admin')
+def action_validate_closure(action_id):
+    db=get_db(); action=db.execute('SELECT * FROM actions WHERE id=?',(action_id,)).fetchone()
+    if not action: abort(404)
+    decision=request.form.get('decision','').strip()
+    if decision not in ('approve','reject'): abort(400)
+    if decision=='approve' and int(action['progress'] or 0)<100:
+        flash('No se puede aprobar el cierre: el avance debe ser 100 %.','error')
+        return redirect(url_for('risk_detail',risk_id=action['risk_id']))
+    user=current_user()
+    if decision=='approve':
+        db.execute("UPDATE actions SET status='Completada',closure_status='Validada',closure_validated_by=?,closure_validated_at=CURRENT_TIMESTAMP WHERE id=?",(user['id'],action_id))
+        detail='Cierre de acción validado por administrador'
+    else:
+        db.execute("UPDATE actions SET status='En curso',closure_status='Rechazada',closure_validated_by=?,closure_validated_at=CURRENT_TIMESTAMP WHERE id=?",(user['id'],action_id))
+        detail='Cierre rechazado; requiere seguimiento'
+    audit('action',action_id,'closure_'+decision,detail); db.commit()
+    flash('Cierre validado.' if decision=='approve' else 'Cierre rechazado; la acción vuelve a seguimiento.','success')
+    return redirect(url_for('risk_detail',risk_id=action['risk_id']))
+
+@app.route('/risks/<int:risk_id>/reevaluate', methods=['GET','POST'])
+@role_required('admin')
+def risk_reevaluate(risk_id):
+    db=get_db(); risk=db.execute('SELECT * FROM risks WHERE id=?',(risk_id,)).fetchone()
+    if not risk: abort(404)
+    if request.method=='POST':
+        justification=request.form.get('justification','').strip()
+        if not justification:
+            flash('La justificación de la reevaluación es obligatoria.','error')
+            return redirect(url_for('risk_reevaluate',risk_id=risk_id))
+        np=form_int('residual_probability'); ni=form_int('residual_impact'); score,level=calculate_risk(np,ni); user=current_user()
+        db.execute('''INSERT INTO risk_reevaluations(risk_id,previous_probability,previous_impact,previous_score,previous_level,new_probability,new_impact,new_score,new_level,justification,responsible_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
+          (risk_id,risk['residual_probability'],risk['residual_impact'],risk['residual_score'],risk['residual_level'],np,ni,score,level,justification,user['id']))
+        db.execute('UPDATE risks SET residual_probability=?,residual_impact=?,residual_score=?,residual_level=?,reviewed_at=? WHERE id=?',(np,ni,score,level,date.today().isoformat(),risk_id))
+        audit('risk',risk_id,'residual_reevaluation',f"{risk['residual_score']} {risk['residual_level']} -> {score} {level}; {justification[:180]}")
+        db.commit(); flash('Reevaluación residual registrada con trazabilidad.','success')
+        return redirect(url_for('risk_detail',risk_id=risk_id))
+    return render_template('risk_reevaluate.html',title='Reevaluar riesgo residual',risk=risk,probability=PROBABILITY,impact_labels=IMPACT)
 
 @app.route('/reports/risks.csv')
 @role_required('admin','gestor','consulta')
