@@ -1,0 +1,78 @@
+name: Package SGSI update
+on:
+  push:
+    branches:
+      - sgsi-etapas-1-2
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Check Python syntax
+        run: python -m py_compile app.py
+      - name: Initialize database and verify migration tables
+        env:
+          DB_PATH: /tmp/sgsi-test.db
+          SECRET_KEY: test-only-not-for-production
+        run: |
+          python - <<'PY'
+          import app
+          with app.app.app_context():
+              app.init_db()
+              db = app.get_db()
+              required = {
+                  'actions': {'closure_status', 'closure_validated_by', 'closure_validated_at'},
+                  'audit_log': {'user_id'},
+                  'action_evidence': {'id', 'action_id', 'description', 'reference', 'submitted_by', 'created_at'},
+                  'risk_reevaluations': {'id', 'risk_id', 'justification', 'responsible_id', 'created_at'},
+              }
+              for table, columns in required.items():
+                  actual = {r['name'] for r in db.execute(f'PRAGMA table_info({table})')}
+                  missing = columns - actual
+                  assert not missing, f'{table}: missing {missing}'
+              assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+          print('Database initialization and schema checks passed.')
+          PY
+      - name: Build deployment ZIP without local data or secrets
+        run: |
+          mkdir -p package/sgsi
+          cp app.py Dockerfile docker-compose.yml requirements.txt README.md package/sgsi/
+          cp -r templates static package/sgsi/
+          cat > package/sgsi/ACTUALIZACION.md <<'EOF'
+          # Actualización SGSI - Etapas 1 y 2
+          ## Antes de actualizar
+          1. Realice una copia de seguridad consistente de la base SQLite y de la carpeta de datos persistentes.
+          2. Mantenga fuera del ZIP y del repositorio los archivos .env, sgsi.db, respaldos y credenciales.
+          3. Revise docker-compose.yml y confirme el nombre real del volumen de datos existente. No ejecute docker compose down -v.
+          ## Instalación sugerida
+          1. Descomprima este paquete en una carpeta nueva.
+          2. Copie únicamente la configuración local necesaria; no sustituya el .env de producción por valores de ejemplo.
+          3. Verifique que el servicio siga montando el volumen SQLite actual en /data.
+          4. Desde la carpeta del proyecto ejecute docker compose build y luego docker compose up -d.
+          5. Revise docker compose logs --tail=100 y compruebe la aplicación antes de liberar el uso.
+          La aplicación añade columnas y tablas mediante migraciones incrementales. Aun así, pruebe primero con una copia de la base. Si falla, detenga el contenedor, restaure el código anterior y la copia de seguridad; no borre el volumen.
+          ## Funciones incorporadas
+          - Colores de estado de implementación en SoA.
+          - Avance agregado de tratamiento por riesgo.
+          - Filtros por estado y acciones vencidas.
+          - Evidencias descriptivas con referencia opcional, responsable y fecha.
+          - Solicitud de cierre al llegar a 100% y validación explícita por administrador.
+          - Reevaluación residual con justificación e historial.
+          - Identificación del usuario en nuevas entradas de auditoría.
+          Este paquete no incluye base de datos, .env, adjuntos ni credenciales. La evidencia se registra como descripción y referencia; no se suben archivos binarios.
+          EOF
+          cd package && zip -qr ../sgsi-etapas-1-2.zip sgsi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sgsi-etapas-1-2
+          path: sgsi-etapas-1-2.zip
+          if-no-files-found: error
+          retention-days: 14
