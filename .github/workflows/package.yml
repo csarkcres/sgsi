@@ -53,10 +53,10 @@ jobs:
           2. Mantenga fuera del ZIP y del repositorio los archivos .env, sgsi.db, respaldos y credenciales.
           3. Revise docker-compose.yml y confirme el nombre real del volumen de datos existente. No ejecute docker compose down -v.
           ## Instalación sugerida
-          1. Descomprima este paquete en una carpeta nueva.
-          2. Copie únicamente la configuración local necesaria; no sustituya el .env de producción por valores de ejemplo.
+          1. Descomprima el paquete en una carpeta temporal. No ejecute Docker Compose desde esa carpeta, porque podría crear un volumen de datos distinto.
+          2. Copie los archivos de aplicación, plantillas y estáticos sobre la carpeta original del proyecto donde ya se ejecuta el contenedor. Mantenga intacto el .env local.
           3. Verifique que el servicio siga montando el volumen SQLite actual en /data.
-          4. Desde la carpeta del proyecto ejecute docker compose build y luego docker compose up -d.
+          4. Desde la misma carpeta original del proyecto ejecute docker compose build y luego docker compose up -d; no cambie de carpeta para conservar el volumen nombrado existente.
           5. Revise docker compose logs --tail=100 y compruebe la aplicación antes de liberar el uso.
           La aplicación añade columnas y tablas mediante migraciones incrementales. Aun así, pruebe primero con una copia de la base. Si falla, detenga el contenedor, restaure el código anterior y la copia de seguridad; no borre el volumen.
           ## Funciones incorporadas
